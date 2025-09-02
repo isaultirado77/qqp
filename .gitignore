@@ -1,0 +1,20 @@
+# venvs
+.venv/
+
+# python
+__pycache__/
+
+# vscode
+.vscode/
+
+# jupyter files
+.ipynb_checkpoints/
+
+# data
+data/raw/*
+data/processed/*
+!data/.gitkeep
+
+# temp/logs files
+*.log
+*.tmp
