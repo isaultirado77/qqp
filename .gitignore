@@ -18,3 +18,5 @@ data/processed/*
 # temp/logs files
 *.log
 *.tmp
+TODO.md
+
