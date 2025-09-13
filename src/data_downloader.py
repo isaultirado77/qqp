@@ -1,8 +1,12 @@
 """
 Módulo para descargar y cargar datos de la base 'Quién es Quién en los Precios' (Profeco).
 """
-import os
+
+from __init__ import BASE, DATA, RAW
+
 import re
+import rarfile
+import logging
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -11,9 +15,16 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from bs4 import BeautifulSoup
 
+
+# loggin config
+logging.basicConfig(
+    level=logging.INFO,
+    format="\n%(asctime)s - %(levelname)s - [%(filename)s] - %(message)s"
+)
+
 URL_BASE = "https://datos.profeco.gob.mx/datos_abiertos/qqp.php"
 URL_DOWNLOAD_ROOT = "https://datos.profeco.gob.mx/datos_abiertos/"
-RAW_DATA_PATH = Path().parent.joinpath("data/raw")
+
 
 def get_file_links():
     """
@@ -31,7 +42,32 @@ def get_file_links():
                 dict_links[year] = URL_DOWNLOAD_ROOT+"/"+href
     return dict_links
 
-def download_file(url, path=RAW_DATA_PATH):
+def check_existing(years, path=RAW):
+    """
+    Checa si existen archivos o carpetas en `path` que contengan el año en su nombre.
+    Devuelve una lista con los años que faltan.
+    """
+    missing = []
+    existing_items = [p.name for p in path.iterdir()]
+
+    for year in years:
+        if any(str(year) in name for name in existing_items):
+            logging.info(f"Year {year} already exists {path.relative_to(path)}.")
+        else:
+            missing.append(year)
+
+    return missing
+
+def is_valid_rar(file_path):
+    try:
+        with rarfile.RarFile(file_path, "r") as rf:
+            rf.testrar()
+        return True
+    except rarfile.Error as e:
+        logging.warning("Invalid rar file: %s (%s)", file_path, e)
+        return False
+
+def download_file(url, path=RAW):
     """
     """
     response = requests.get(url, stream=True) 
@@ -44,18 +80,22 @@ def download_file(url, path=RAW_DATA_PATH):
         filename = url.split("/")[-1]
 
     file_path = path / filename
-
-    if file_path.is_file(): # The file already exists
-       return 
      
     # download by chunks
     with open(file_path, mode='wb') as file:
         for chunk in response.iter_content(chunk_size=1024*1024):  # 1 MB
             if chunk:  # avoid empty chunks
                 file.write(chunk)
+
+    # Validate file
+    if not is_valid_rar(file_path):
+            logging.warning(f'Incomplete download for {file_path.name}, retrying...')
+            file_path.unlink(missing_ok=True)  # eliminar incompleto
+            return download_file(url, path)  # reintento
+
     
     if file_path.is_file(): 
-        print('Data downloaded at: ', file_path)
+        logging.info(f"Data downloaded at: {file_path.relative_to(RAW)}")
         
     return file_path
 
@@ -65,20 +105,7 @@ def download_files(urls, downloader=download_file):
     with ThreadPoolExecutor(max_workers=3) as executor: 
         executor.map(downloader, urls)
 
-def check_existing(years, path=RAW_DATA_PATH): 
-    """
-    """
-    missing = []
-    for year in years:
-        year_folder = path / f'QQP_{year}'
-        year_file = path / f'QQP_{year}.rar'
-        if  year_folder.exists() or year_file.exists(): 
-            print(f'Year {year} already exists.')
-        else: 
-            missing.append(year)
-    return missing
-
-def run_downloader(years=None, path=RAW_DATA_PATH): 
+def run_downloader(years=None, path=RAW): 
     """
     Descarga los datos de para los años indicados. 
     Si `years` es None, intenta descargar todos los disponibles. 
@@ -92,10 +119,10 @@ def run_downloader(years=None, path=RAW_DATA_PATH):
     urls = [links[y] for y in years_to_download]
     
     if urls:
-        print('Downloading...') 
+        logging.info('Downloading...') 
         download_files(urls)
     else:
-        print('All files are already downloaded/unzipped')
+        logging.info('All year files are already downloaded/unzipped/extracted')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Descargar datos de Profeco por año")
