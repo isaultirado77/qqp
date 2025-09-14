@@ -2,33 +2,35 @@
 Módulo para descargar y cargar datos de la base 'Quién es Quién en los Precios' (Profeco).
 """
 
-from __init__ import BASE, DATA, RAW
+from src.config import BASE, DATA, RAW
+from src.utils.loggin_config import get_logger
 
+import time
+import datetime
 import re
 import rarfile
-import logging
+import json
 import argparse
 from pathlib import Path
+from hashlib import md5
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 
 import requests
+import tqdm
 from bs4 import BeautifulSoup
 
 
 # loggin config
-logging.basicConfig(
-    level=logging.INFO,
-    format="\n%(asctime)s - %(levelname)s - [%(filename)s] - %(message)s"
-)
+logger = get_logger(__name__)
 
 URL_BASE = "https://datos.profeco.gob.mx/datos_abiertos/qqp.php"
 URL_DOWNLOAD_ROOT = "https://datos.profeco.gob.mx/datos_abiertos/"
+# URL_TEST = "https://datos.profeco.gob.mx/lol-no-existe"
 
 
 def get_file_links():
-    """
-    """
     dict_links = {} 
     responce = requests.get(URL_BASE)
     if responce.status_code == 200: 
@@ -40,23 +42,26 @@ def get_file_links():
             if match: 
                 year = match.group(1)
                 dict_links[year] = URL_DOWNLOAD_ROOT+"/"+href
+    else: 
+        logger.critical("Responce error. ")
+        return {}
     return dict_links
 
 def check_existing(years, path=RAW):
-    """
-    Checa si existen archivos o carpetas en `path` que contengan el año en su nombre.
-    Devuelve una lista con los años que faltan.
-    """
     missing = []
-    existing_items = [p.name for p in path.iterdir()]
-
-    for year in years:
-        if any(str(year) in name for name in existing_items):
-            logging.info(f"Year {year} already exists {path.relative_to(path)}.")
-        else:
-            missing.append(year)
-
-    return missing
+    existing = []
+    existing_files = [f.name for f in path.iterdir()
+                      if (f.is_file() and 
+                          f.suffix in {'.rar', '.RAR', '.zip', '.ZIP'})]
+    
+    for y in years: 
+        if any(str(y) in name for name in existing_files): 
+            logger.info(f'Year {y}.zip already exists in {path.relative_to(BASE)}, skipping...\n')
+            existing.append(y)
+        else: 
+            missing.append(y)
+    
+    return missing, existing
 
 def is_valid_rar(file_path):
     try:
@@ -64,12 +69,32 @@ def is_valid_rar(file_path):
             rf.testrar()
         return True
     except rarfile.Error as e:
-        logging.warning("Invalid rar file: %s (%s)", file_path, e)
+        logger.error(f"Invalid rar file: {file_path} ({e})")
         return False
+    
+def generate_download_metadata(filename, file_path, url, hash_value, is_valid_rar, download_time):
+    metadata_dir = RAW / "metadata_download"
+    metadata_dir.mkdir(exist_ok=True) 
+    # logger.debug(f'{metadata_dir}: {metadata_dir.exists()}') OK
+
+    metadata = {
+        'filename': filename, 
+        'path': str(file_path),
+        'url': url, 
+        'date_downloaded': datetime.now().isoformat(), 
+        'hash': hash_value,
+        'file_size_actual': file_path.stat().st_size, 
+        'valid': is_valid_rar, 
+        'elapsed_time': download_time
+    }
+
+    # guardar metadatos en data/raw/metadata_download
+    metadata_file = metadata_dir / f"{filename}.json"
+    with open(metadata_file, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=4, ensure_ascii=False)  # OK
+    
 
 def download_file(url, path=RAW):
-    """
-    """
     response = requests.get(url, stream=True) 
 
     # Get filename
@@ -80,28 +105,43 @@ def download_file(url, path=RAW):
         filename = url.split("/")[-1]
 
     file_path = path / filename
-     
+    hash_object = md5()
+    chunk_size = 10*1024*1024  # 10 MB
+    start = time.time()
+        
     # download by chunks
-    with open(file_path, mode='wb') as file:
-        for chunk in response.iter_content(chunk_size=1024*1024):  # 1 MB
-            if chunk:  # avoid empty chunks
-                file.write(chunk)
+    with open(file_path, "wb") as f:
+        # print(f"Downloading {filename}: ", end="", flush=True)
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if chunk:
+                f.write(chunk)
+                hash_object.update(chunk)
+                # print("|", end="", flush=True)  # imprime barra por cada chunk
+        print()
+
+    elapsed = time.time() - start
 
     # Validate file
     if not is_valid_rar(file_path):
-            logging.warning(f'Incomplete download for {file_path.name}, retrying...')
+            logger.warning(f'Incomplete download for {file_path.name}, retrying...')
             file_path.unlink(missing_ok=True)  # eliminar incompleto
             return download_file(url, path)  # reintento
 
-    
+    _ = generate_download_metadata(
+        filename=filename,
+        file_path=file_path.relative_to(BASE),
+        url=url,
+        hash_value=hash_object.hexdigest(),
+        is_valid_rar=is_valid_rar(file_path),
+        download_time=elapsed
+    )
+
     if file_path.is_file(): 
-        logging.info(f"Data downloaded at: {file_path.relative_to(RAW)}")
+        logger.info(f"Data downloaded at: {file_path.relative_to(BASE)} in {elapsed:.1}s\n")
         
     return file_path
 
 def download_files(urls, downloader=download_file): 
-    """
-    """
     with ThreadPoolExecutor(max_workers=3) as executor: 
         executor.map(downloader, urls)
 
@@ -110,19 +150,30 @@ def run_downloader(years=None, path=RAW):
     Descarga los datos de para los años indicados. 
     Si `years` es None, intenta descargar todos los disponibles. 
     """
-    links = get_file_links()
+    links_dic = get_file_links()
+    # for k, v in links.items(): logger.debug(f"{k}: {v}")  # OK
+    # if not links: 
+    #     logger.debug("LOL, NO LINKS")
+    #     return 
     
     if years: 
-        selected_years = [year for year in years if year in links]
+        selected_years = (year for year in years if year in links_dic)
+    # logger.debug(str(selected_years))  # OK
+
+    years_to_download, _ = check_existing(selected_years)
+    # logger.debug(years_to_download)  # OK
     
-    years_to_download = check_existing(selected_years)
-    urls = [links[y] for y in years_to_download]
+    links = (links_dic[y] for y in years_to_download)
+    # for l in links: logger.debug(l)  # OK
     
-    if urls:
-        logging.info('Downloading...') 
-        download_files(urls)
+    if links:
+        start = datetime.now()
+        logger.info(f'Start download process at: {start.isoformat()})\n') 
+        download_files(links)
+        end = datetime.now()
+        logger.info(f'End download process at: {end.isoformat()}')
     else:
-        logging.info('All year files are already downloaded/unzipped/extracted')
+        logger.info('All year files are already downloaded. ')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Descargar datos de Profeco por año")
